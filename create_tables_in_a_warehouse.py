@@ -81,7 +81,7 @@ def create_sales_fact_table(conn, logger):
             conn.commit()
             logger.info("Sales_fact table created successfully.")
     except Exception as e:
-        logger.error(f"Failed to create Sales_fact table. Error: {e}")
+        logger.error(f"Failed to create Sales_fact table.  Error: {e}")
 
 
 def create_supplier_dimension_table(conn, logger):
