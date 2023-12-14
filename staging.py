@@ -48,7 +48,7 @@ def intialize_logger():
     return logger
 
 
-def cascade_truncate_tables():
+def cascade_truncate_tables(logger):
     warehouse_conn, warehouse_cursor = None, None
     try:
         # Connect to the data warehouse
@@ -84,12 +84,13 @@ def cascade_truncate_tables():
         warehouse_conn.commit()
 
     except OperationalError as e:
-        print(f"Error connecting to the data warehouse: {e}")
+        logger.error(f"Error connecting to the data warehouse: {e}")
 
     finally:
         # Close cursor and connection
         warehouse_cursor.close()
         warehouse_conn.close()
+        logger.info("Tables truncated successfully")
 
 
 # delta load location table
@@ -176,7 +177,7 @@ def perform_delta_load_location(ETL_LOAD_FOLDER, logger):
                 warehouse_conn.commit()
 
                 # Log success
-                logger.info("Delta load for location completed successfully. rows inserted {len(rows)}")
+                logger.info(f"Delta load for location completed successfully. rows inserted {len(rows)}")
 
         except Exception as e:
             # Log the error
@@ -457,7 +458,7 @@ def perform_delta_load_payment_method(ETL_LOAD_FOLDER, logger):
             json.dump(data, file)
 
     try:
-        # Connect to the production database,
+        # Connect to the production database
         production_conn = psycopg2.connect(
             database="production",
             user="postgres",
@@ -966,7 +967,10 @@ def perform_delta_load_marketing_campaigns(ETL_LOAD_FOLDER, logger):
             # Update the last extracted campaign_id
             if records:
                 last_extracted_campaign_id = max(record[0] for record in records)
-
+                logger.info(
+                    f"Delta load for marketing_campaigns completed successfully. Records inserted: {len(records)}")
+            else:
+                logger.info("No new records to load for marketing_campaigns")
             # Commit changes
             warehouse_conn.commit()
 
@@ -974,7 +978,6 @@ def perform_delta_load_marketing_campaigns(ETL_LOAD_FOLDER, logger):
             write_last_extracted_campaign_id(last_extracted_campaign_id)
 
             # Log success
-            logger.info("Delta load for marketing_campaigns completed successfully. Records inserted: {len(records)}")
 
         except Exception as e:
             # Log the error
@@ -1080,15 +1083,16 @@ def perform_delta_load_customer_product_ratings(ETL_LOAD_FOLDER, logger):
             if records:
                 last_extracted_rating_id = max(record[0] for record in records)
 
+                # Log success
+                logger.info(
+                    f"Delta load for customer_product_ratings completed successfully. Records inserted: {len(records)}")
+            else:
+                logger.info("No new records to load for customer_product_ratings")
             # Commit changes
             warehouse_conn.commit()
 
             # Write the updated last extracted rating_id to the JSON file
             write_last_extracted_rating_id(last_extracted_rating_id)
-
-            # Log success
-            logger.info(
-                f"Delta load for customer_product_ratings completed successfully. Records inserted: {len(records)}")
 
         except Exception as e:
             # Log the error
@@ -1466,14 +1470,16 @@ def perform_delta_load_returns(ETL_LOAD_FOLDER, logger):
 
 
 def main():
+    # load etl path
+    ETL_LOAD_FOLDER = load_etl_path()
+    # setting up a log
+    logger = intialize_logger()
+
     testing_flag = False
+
     if testing_flag:
-        cascade_truncate_tables()
+        cascade_truncate_tables(logger)
     else:
-        # load etl path
-        ETL_LOAD_FOLDER = load_etl_path()
-        # setting up a log
-        logger = intialize_logger()
         # load location table
         perform_delta_load_location(ETL_LOAD_FOLDER, logger)
         # load category table
@@ -1490,6 +1496,10 @@ def main():
         perform_delta_load_customer(ETL_LOAD_FOLDER, logger)
         # load marketing campaign table
         perform_delta_load_marketing_campaigns(ETL_LOAD_FOLDER, logger)
+        # load customer_product_ratings table
+        perform_delta_load_customer_product_ratings(ETL_LOAD_FOLDER, logger)
+        # load orders table
+        perform_delta_load_orders(ETL_LOAD_FOLDER, logger)
 
 
 if __name__ == "__main__":
