@@ -457,7 +457,7 @@ def perform_delta_load_payment_method(ETL_LOAD_FOLDER, logger):
             json.dump(data, file)
 
     try:
-        # Connect to the production database
+        # Connect to the production database,
         production_conn = psycopg2.connect(
             database="production",
             user="postgres",
