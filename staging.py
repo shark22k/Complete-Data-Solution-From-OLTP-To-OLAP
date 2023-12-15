@@ -2,7 +2,10 @@ import psycopg2
 import json
 import logging
 import os
-from psycopg2 import OperationalError
+from psycopg2 import OperationalError, sql
+import psycopg2
+from psycopg2 import sql
+from psycopg2 import IntegrityError, DataError
 
 
 # setup a etl path
@@ -48,7 +51,7 @@ def intialize_logger():
     return logger
 
 
-def cascade_truncate_tables(logger):
+def cascade_truncate_tables_staging(logger):
     warehouse_conn, warehouse_cursor = None, None
     try:
         # Connect to the data warehouse
@@ -75,6 +78,49 @@ def cascade_truncate_tables(logger):
             "staging.product",
             "staging.customer",
             "staging.marketing_campaigns"
+        ]
+
+        for table in tables:
+            warehouse_cursor.execute(f"TRUNCATE TABLE {table} CASCADE")
+
+        # Commit the changes to the data warehouse
+        warehouse_conn.commit()
+
+    except OperationalError as e:
+        logger.error(f"Error connecting to the data warehouse: {e}")
+
+    finally:
+        # Close cursor and connection
+        warehouse_cursor.close()
+        warehouse_conn.close()
+        logger.info("Tables truncated successfully")
+
+
+def cascade_truncate_tables_core(logger):
+    warehouse_conn, warehouse_cursor = None, None
+    try:
+        # Connect to the data warehouse
+        warehouse_conn = psycopg2.connect(
+            database="warehouse",
+            user="postgres",
+            password="swati",
+            host="localhost",
+            port="5432"
+        )
+
+        # Create a cursor for the data warehouse
+        warehouse_cursor = warehouse_conn.cursor()
+
+        # Truncate tables in a specific order to avoid foreign key constraint errors
+        tables = [
+            "core.Sales_fact",
+            "core.supplier_dimension",
+            "core.Order_dimension",
+            "core.campaign_dimension",
+            "core.customer_dimension",
+            "core.product_dimension",
+            "core.time_dimension",
+            "core.returns_fact"
         ]
 
         for table in tables:
@@ -1469,37 +1515,442 @@ def perform_delta_load_returns(ETL_LOAD_FOLDER, logger):
             warehouse_conn.close()
 
 
+def perform_delta_load_staging(ETL_LOAD_FOLDER, logger):
+    # load location table
+    perform_delta_load_location(ETL_LOAD_FOLDER, logger)
+    # load category table
+    perform_delta_load_category(ETL_LOAD_FOLDER, logger)
+    # load supplier table
+    perform_delta_load_supplier(ETL_LOAD_FOLDER, logger)
+    # load payment method table
+    perform_delta_load_payment_method(ETL_LOAD_FOLDER, logger)
+    # load subcategory table
+    perform_delta_load_subcategory(ETL_LOAD_FOLDER, logger)
+    # load product table
+    perform_delta_load_product(ETL_LOAD_FOLDER, logger)
+    # load customer table
+    perform_delta_load_customer(ETL_LOAD_FOLDER, logger)
+    # load marketing campaign table
+    perform_delta_load_marketing_campaigns(ETL_LOAD_FOLDER, logger)
+    # load customer_product_ratings table
+    perform_delta_load_customer_product_ratings(ETL_LOAD_FOLDER, logger)
+    # load orders table
+    perform_delta_load_orders(ETL_LOAD_FOLDER, logger)
+
+
+#####################################################################################################
+def delta_core_load_time_dimension(logger):
+    """
+    Creates time dimension records from the orders in staging table.
+
+    Args:
+        conn (connection): Connection to the warehouse database.
+
+    Returns:
+        None
+    """
+    conn = psycopg2.connect(
+        database="warehouse",
+        user="postgres",
+        password="swati",
+        host="localhost",
+        port="5432"
+    )
+    try:
+        with conn.cursor() as cursor:
+            # Create Time Dimension Records from Orders with Hierarchy-based time_id
+            query = sql.SQL("""
+                INSERT INTO core.time_dimension (timeid, date, day, month, year, day_name, is_weekend, month_name, quarter, hour, minutes, seconds)
+                SELECT DISTINCT 
+                    EXTRACT(EPOCH FROM order_timestamp)::BIGINT AS timeid,
+                    date_trunc('day', order_timestamp) AS date,
+                    EXTRACT(day FROM order_timestamp) AS day,
+                    EXTRACT(month FROM order_timestamp) AS month,
+                    EXTRACT(year FROM order_timestamp) AS year,
+                    TO_CHAR(order_timestamp, 'Day') AS day_name,
+                    CASE WHEN EXTRACT(ISODOW FROM order_timestamp) IN (6,7) THEN 1 ELSE 0 END AS is_weekend,
+                    TO_CHAR(order_timestamp, 'Month') AS month_name,
+                    EXTRACT(quarter FROM order_timestamp) AS quarter,
+                    EXTRACT(hour FROM order_timestamp) AS hour,
+                    EXTRACT(minute FROM order_timestamp) AS minutes,
+                    EXTRACT(second FROM order_timestamp) AS seconds
+                FROM staging.orders;
+            """)
+            cursor.execute(query)
+
+        # Commit the changes
+        conn.commit()
+        logger.info("Time Dimension records created successfully")
+
+    except Exception as e:
+        logger.error(f"Error connecting to the data warehouse: {e}")
+
+    finally:
+        # Close the connection
+        conn.close()
+
+
+def delta_core_load_customer_dimension(logger):
+    """
+    Fill the customer_dimension table in the warehouse database with customer information.
+
+    Args:
+        warehouse_conn: Connection object for the warehouse database.
+
+    Returns:
+        None
+    """
+    warehouse_conn = psycopg2.connect(
+        database="warehouse",
+        user="postgres",
+        password="swati",
+        host="localhost",
+        port="5432"
+    )
+    try:
+        with warehouse_conn.cursor() as cursor:
+
+            # Insert records into core.customer_dimension by combining information from customer and location
+            query = sql.SQL("""
+                INSERT INTO core.customer_dimension (customer_id, first_name, last_name, email, country, state, city, latitude, longitude)
+                SELECT
+                    c.customer_id,
+                    c.first_name,
+                    c.last_name,
+                    c.email,
+                    l.country,
+                    l.state,
+                    l.city,
+                    l.latitude,
+                    l.longitude
+                FROM staging.customer c
+                JOIN staging.location l ON c.location_id = l.location_id;
+            """)
+            cursor.execute(query)
+
+        # Commit the changes
+        warehouse_conn.commit()
+
+        logger.info("Customer Dimension records filled successfully.")
+
+    except Exception as e:
+        logger.error(f"Error connecting to the data warehouse: {e}")
+
+    finally:
+        # Close the connection
+        warehouse_conn.close()
+
+
+def delta_core_load_product_dimension(logger):
+    """
+    Load product dimension data from staging tables into the core.product_dimension table.
+
+    Parameters:
+    - logger: The logger object used for logging.
+
+    Returns:
+    None
+    """
+    warehouse_conn = psycopg2.connect(
+        database="warehouse",
+        user="postgres",
+        password="swati",
+        host="localhost",
+        port="5432"
+    )
+
+    try:
+        with warehouse_conn.cursor() as cursor:
+            # Insert records into core.product_dimension by combining information from product, category,
+            # and subcategory
+            query = sql.SQL("""
+                INSERT INTO core.product_dimension (product_id, name, price, description, category, sub_category)
+                SELECT
+                    p.product_id,
+                    p.name,
+                    p.price,
+                    p.description,
+                    c.category_name,
+                    s.subcategory_name
+                FROM staging.product p
+                JOIN staging.subcategory s ON p.subcategory_id = s.subcategory_id
+                JOIN staging.category c ON s.category_id = c.category_id;
+            """)
+            cursor.execute(query)
+
+        # Commit the changes
+        warehouse_conn.commit()
+        logger.info("Product Dimension records filled successfully.")
+
+    except Exception as e:
+        logger.error("Product Dimension not created", e)
+
+    finally:
+        # Close the connection
+        warehouse_conn.close()
+
+
+def delta_core_load_campaign_dimension(logger):
+    warehouse_conn = psycopg2.connect(
+        database="warehouse",
+        user="postgres",
+        password="swati",
+        host="localhost",
+        port="5432"
+    )
+
+    try:
+        with warehouse_conn.cursor() as cursor:
+            # Insert records into core.campaign_dimension with mapped start_date and end_date
+            query = sql.SQL("""
+                INSERT INTO core.campaign_dimension (campaign_id, campaign_name, start_date, end_date)
+                SELECT
+                    campaign_id,
+                    campaign_name,
+                    start_date,
+                    end_date
+                FROM (
+                    SELECT
+                        campaign_id,
+                        campaign_name,
+                        (DATE '2022-01-01' + (offer_week - 1) * 7) AS start_date,
+                        (DATE '2022-01-01' + (offer_week) * 7 - 1) AS end_date
+                    FROM staging.marketing_campaigns
+                ) AS mapped_campaigns;
+            """)
+            cursor.execute(query)
+
+        # Commit the changes
+        warehouse_conn.commit()
+        logger.info("Campaign Dimension records filled successfully.")
+
+    except Exception as e:
+        logger.error("Campaign Dimension, not created", e)
+
+    finally:
+        # Close the connection
+        warehouse_conn.close()
+
+
+def delta_core_load_order_dimension(logger):
+    warehouse_conn = psycopg2.connect(
+        database="warehouse",
+        user="postgres",
+        password="swati",
+        host="localhost",
+        port="5432"
+    )
+
+    try:
+        with warehouse_conn.cursor() as cursor:
+            # Insert records into core.order_dimension by combining information from orders, payment_method,
+            # and customers
+            query = sql.SQL("""
+                INSERT INTO core.order_dimension (order_id, customer_id, payment_method)
+                SELECT
+                    o.order_id,
+                    o.customer_id,
+                    pm.payment_method
+                FROM staging.orders o
+                JOIN staging.payment_method pm ON o.payment_method_id = pm.payment_method_id
+            """)
+            cursor.execute(query)
+
+        # Commit the changes
+        warehouse_conn.commit()
+        logger.info("Order Dimension records filled successfully.")
+
+    except Exception as e:
+        logger.error("Order Dimension, not created", e)
+
+    finally:
+        # Close the connection
+        warehouse_conn.close()
+
+
+def delta_core_load_supplier_dimension(logger):
+    warehouse_conn = psycopg2.connect(
+        database="warehouse",
+        user="postgres",
+        password="swati",
+        host="localhost",
+        port="5432"
+    )
+
+    try:
+        with warehouse_conn.cursor() as cursor:
+            # Insert records into core.supplier_dimension
+            query = sql.SQL("""
+                INSERT INTO core.supplier_dimension (supplier_id, supplier_name, email)
+                SELECT
+                    supplier_id,
+                    supplier_name,
+                    email
+                FROM staging.supplier;
+            """)
+            cursor.execute(query)
+
+        # Commit the changes
+        warehouse_conn.commit()
+        logger.info("Supplier Dimension records filled successfully.")
+
+    except Exception as e:
+        logger.error("Supplier Dimension, not created", e)
+
+    finally:
+        # Close the connection
+        warehouse_conn.close()
+
+
+def delta_core_load_sales_fact(logger):
+    warehouse_conn = psycopg2.connect(
+        database="warehouse",
+        user="postgres",
+        password="swati",
+        host="localhost",
+        port="5432"
+    )
+    try:
+        with warehouse_conn.cursor() as cursor:
+
+            # Insert records into core.sales_fact by combining information from orderitem and orders
+            query = sql.SQL("""
+                INSERT INTO core.sales_fact (order_id, time_id, product_id, customer_id, campaign_id, supplier_id, quantity, subtotal, discount_percentage, sales_price)
+                SELECT
+                    o.order_id,
+                    EXTRACT(EPOCH FROM o.order_timestamp)::integer AS time_id,
+                    oi.product_id,
+                    o.customer_id,
+                    COALESCE(o.campaign_id, 0),  -- Replace NULL with 0 using COALESCE
+                    oi.supplier_id,
+                    oi.quantity,
+                    oi.subtotal,
+                    oi.discount,
+                    (1-oi.discount) * oi.subtotal AS sales_price
+                FROM staging.orderitem oi
+                JOIN staging.orders o ON oi.order_id = o.order_id;
+            """)
+            cursor.execute(query)
+
+        # Commit the changes
+        warehouse_conn.commit()
+
+        logger.info("Sales Fact records filled successfully.")
+
+    except Exception as e:
+        logger.error("sales_fact, not created", e)
+
+    finally:
+        # Close the connection
+        warehouse_conn.close()
+
+
+def delta_core_load_returns_fact(logger):
+    warehouse_conn = psycopg2.connect(
+        database="warehouse",
+        user="postgres",
+        password="swati",
+        host="localhost",
+        port="5432"
+    )
+    try:
+        with warehouse_conn.cursor() as cursor:
+            # Insert records into core.returns_fact
+            query = sql.SQL("""
+                INSERT INTO core.returns_fact (return_id, order_id, product_id, return_date, reason, amount_refunded)
+                SELECT
+                    return_id,
+                    order_id,
+                    product_id,
+                    return_date,
+                    reason,
+                    amount_refunded
+                FROM staging.returns;
+            """)
+            cursor.execute(query)
+
+        # Commit the changes
+        warehouse_conn.commit()
+
+        logger.info("Returns Fact records filled successfully.")
+
+    except IntegrityError as integrity_error:
+        logger.error("Integrity error: %s", integrity_error)
+    except DataError as data_error:
+        logger.error("Data error: %s", data_error)
+    except psycopg2.Error as e:
+        logger.error("Unexpected error: %s", e)
+
+    finally:
+        # Close the connection
+        warehouse_conn.close()
+
+def delta_core_load_customer_product_ratings_fact(logger):
+    warehouse_conn = psycopg2.connect(
+        database="warehouse",
+        user="postgres",
+        password="swati",
+        host="localhost",
+        port="5432"
+    )
+    try:
+        with warehouse_conn.cursor() as cursor:
+            # Insert records into core.customer_product_fact
+            query = sql.SQL("""
+                INSERT INTO core.customer_product_ratings_fact (customerproductrating_id, customer_id, product_id, ratings, review, sentiment)
+                SELECT
+                    customerproductrating_id,
+                    customer_id,
+                    product_id,
+                    ratings,
+                    review,
+                    sentiment
+                FROM staging.customer_product_ratings;
+            """)
+            cursor.execute(query)
+
+        # Commit the changes
+        warehouse_conn.commit()
+
+        logger.info("Customer Product Fact records filled successfully.")
+
+    except IntegrityError as integrity_error:
+        logger.error("Integrity error: %s", integrity_error)
+    except DataError as data_error:
+        logger.error("Data error: %s", data_error)
+    except psycopg2.Error as e:
+        logger.error("Unexpected error: %s", e)
+    finally:
+        # Close the connection
+        warehouse_conn.close()
+
+
+def perform_delta_core_load(logger):
+    testing = True
+    if testing:
+        cascade_truncate_tables_core(logger)
+    else:
+        # delta_core_load_time_dimension(logger)
+        # delta_core_load_customer_dimension(logger)
+        # delta_core_load_product_dimension(logger)
+        # delta_core_load_campaign_dimension(logger)
+        # delta_core_load_order_dimension(logger)
+        # delta_core_load_supplier_dimension(logger)
+        # delta_core_load_sales_fact(logger)
+        # delta_core_load_returns_fact(logger)
+        delta_core_load_customer_product_ratings_fact(logger)
+
 def main():
     # load etl path
     ETL_LOAD_FOLDER = load_etl_path()
     # setting up a log
     logger = intialize_logger()
-
-    testing_flag = False
-
-    if testing_flag:
-        cascade_truncate_tables(logger)
-    else:
-        # load location table
-        perform_delta_load_location(ETL_LOAD_FOLDER, logger)
-        # load category table
-        perform_delta_load_category(ETL_LOAD_FOLDER, logger)
-        # load supplier table
-        perform_delta_load_supplier(ETL_LOAD_FOLDER, logger)
-        # load payment method table
-        perform_delta_load_payment_method(ETL_LOAD_FOLDER, logger)
-        # load subcategory table
-        perform_delta_load_subcategory(ETL_LOAD_FOLDER, logger)
-        # load product table
-        perform_delta_load_product(ETL_LOAD_FOLDER, logger)
-        # load customer table
-        perform_delta_load_customer(ETL_LOAD_FOLDER, logger)
-        # load marketing campaign table
-        perform_delta_load_marketing_campaigns(ETL_LOAD_FOLDER, logger)
-        # load customer_product_ratings table
-        perform_delta_load_customer_product_ratings(ETL_LOAD_FOLDER, logger)
-        # load orders table
-        perform_delta_load_orders(ETL_LOAD_FOLDER, logger)
+    ############################################################################################
+    # perform delta load into staging
+    # perform_delta_load_staging(ETL_LOAD_FOLDER, logger)
+    ############################################################################################
+    # perform core load from staging
+    perform_delta_core_load(logger)
 
 
 if __name__ == "__main__":
