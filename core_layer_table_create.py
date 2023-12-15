@@ -185,7 +185,7 @@ def create_product_dimension_table(conn, logger):
 def create_time_dimension_table(conn, logger):
     sql_query = """
         CREATE TABLE IF NOT EXISTS core.time_dimension (
-            id INTEGER PRIMARY KEY,
+            id SERIAL PRIMARY KEY,
             timeid INTEGER NOT NULL,
             date DATE NOT NULL,
             day SMALLINT NOT NULL,
